@@ -1,0 +1,9 @@
+# Local installer inputs
+install.env
+
+# Downloaded installer assets
+downloads/
+
+# Local run artifacts
+install-log-*.log
+任务进度.md
