@@ -1,6 +1,7 @@
 ﻿[CmdletBinding()]
 param(
     [switch]$Resume,
+    [switch]$AllowUnsafeContinue,
     [string]$InstallLogPath = '',
     [string]$InstallLogSessionId = ''
 )
@@ -11,6 +12,14 @@ $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\windows-common.ps1"
 
 $paths = Get-HermesPaths
+$initialState = Get-HermesState
+$allowUnsafeContinueRequested = $AllowUnsafeContinue.IsPresent -or (
+    $null -ne $initialState -and
+    [string]$initialState.repo_root -eq $paths.RepoRoot -and
+    $initialState.PSObject.Properties.Name -contains 'allow_unsafe_continue' -and
+    $null -ne $initialState.allow_unsafe_continue -and
+    [bool]$initialState.allow_unsafe_continue
+)
 $totalPhases = 8
 $completed = New-Object System.Collections.Generic.List[string]
 $installLogSession = $null
@@ -58,6 +67,24 @@ function Resolve-InstallLogSession {
     return (New-HermesInstallLogSession -RequestedPath $requestedPath -RequestedSessionId $requestedSessionId)
 }
 
+function Set-InstallRuntimeFlags {
+    param(
+        [Parameter(Mandatory = $true)]$Config,
+        [bool]$AllowUnsafeContinue = $false
+    )
+
+    $finalValue = $AllowUnsafeContinue
+    if ($Config.PSObject.Properties.Name -contains 'AllowUnsafeContinue') {
+        $finalValue = ($finalValue -or [bool]$Config.AllowUnsafeContinue)
+        $Config.AllowUnsafeContinue = $finalValue
+    }
+    else {
+        $Config | Add-Member -NotePropertyName AllowUnsafeContinue -NotePropertyValue $finalValue
+    }
+
+    return $Config
+}
+
 function Write-ExceptionDiagnostics {
     param([Parameter(Mandatory = $true)][System.Management.Automation.ErrorRecord]$Record)
 
@@ -69,6 +96,12 @@ function Write-ExceptionDiagnostics {
 
     if ($Record.ScriptStackTrace) {
         Write-Host "Script stack:`n$($Record.ScriptStackTrace)"
+    }
+
+    if ($Record.Exception.Data -and $Record.Exception.Data.Count -gt 0) {
+        foreach ($key in $Record.Exception.Data.Keys) {
+            Write-Host ("Exception.Data[{0}] = {1}" -f $key, $Record.Exception.Data[$key])
+        }
     }
 
     $inner = $Record.Exception.InnerException
@@ -99,6 +132,9 @@ function Ensure-ElevatedSession {
     )
     if ($Resume) {
         $argumentList += '-Resume'
+    }
+    if ($allowUnsafeContinueRequested) {
+        $argumentList += '-AllowUnsafeContinue'
     }
 
     $currentInstallLogPath = Get-CurrentInstallSessionLogPath
@@ -413,24 +449,25 @@ function Show-InstallWizard {
 
 function Ensure-InstallSelection {
     if ($Resume -and (Test-SelectionStateComplete)) {
-        return Get-ResolvedInstallConfig
+        return (Set-InstallRuntimeFlags -Config (Get-ResolvedInstallConfig) -AllowUnsafeContinue:$allowUnsafeContinueRequested)
     }
 
     if (Test-SelectionStateComplete) {
-        return Get-ResolvedInstallConfig
+        return (Set-InstallRuntimeFlags -Config (Get-ResolvedInstallConfig) -AllowUnsafeContinue:$allowUnsafeContinueRequested)
     }
 
-    $currentConfig = Get-ResolvedInstallConfig
+    $currentConfig = Set-InstallRuntimeFlags -Config (Get-ResolvedInstallConfig) -AllowUnsafeContinue:$allowUnsafeContinueRequested
     $selection = Show-InstallWizard -CurrentConfig $currentConfig
     if ($null -eq $selection) {
         exit 3
     }
 
+    $selection = Set-InstallRuntimeFlags -Config $selection -AllowUnsafeContinue:$allowUnsafeContinueRequested
     Save-HermesState -Stage 'selection-complete' -Config $selection -LastResult 'selection-complete'
     $completed.Add(("Selected install mode: {0}" -f $selection.InstallMode))
     $completed.Add(("Selected distro target: {0}" -f $selection.DistroName))
     $completed.Add(("Selected provider mode: {0}" -f $selection.ProviderMode))
-    return Get-ResolvedInstallConfig
+    return (Set-InstallRuntimeFlags -Config (Get-ResolvedInstallConfig) -AllowUnsafeContinue:$allowUnsafeContinueRequested)
 }
 
 function Invoke-Prefetch {
@@ -450,7 +487,7 @@ function Invoke-PrepareTarget {
         return (& $paths.ReusePs)
     }
 
-    return (& "$PSScriptRoot\windows-bootstrap.ps1")
+    return (& "$PSScriptRoot\windows-bootstrap.ps1" -AllowUnsafeContinue:$ResolvedConfig.AllowUnsafeContinue)
 }
 
 function Verify-InstalledTarget {
@@ -544,6 +581,19 @@ function Show-WeChatRoundTripPrompt {
 
 try {
     $installLogSession = Resolve-InstallLogSession
+    $resumeState = $null
+    $resumeLogRecoveredFromState = $false
+    if ($Resume) {
+        $resumeState = Get-HermesState
+        $resumeLogRecoveredFromState = (
+            $null -ne $resumeState -and
+            [string]$resumeState.repo_root -eq $paths.RepoRoot -and
+            -not (Test-HermesAbsolutePath -Path $InstallLogPath) -and
+            [string]::IsNullOrWhiteSpace($InstallLogSessionId) -and
+            (Test-HermesAbsolutePath -Path ([string]$resumeState.install_log_path)) -and
+            -not [string]::IsNullOrWhiteSpace([string]$resumeState.install_log_session_id)
+        )
+    }
     $env:HERMES_INSTALL_LOG_PATH = $installLogSession.FinalLogPath
     $env:HERMES_INSTALL_LOG_SESSION_ID = $installLogSession.SessionId
     Start-Transcript -Path $installLogSession.FinalLogPath -Append -Force | Out-Null
@@ -551,7 +601,12 @@ try {
     Write-Step ("本次安装日志：{0}" -f $installLogSession.FinalLogPath)
     Write-Step ("安装日志会话 ID：{0}" -f $installLogSession.SessionId)
     if ($Resume) {
-        Write-Step ("已从上次进度恢复，继续写入同一日志。当前进程 PID={0}" -f $PID)
+        if ($resumeLogRecoveredFromState) {
+            Write-Step ("已从上次进度恢复，并从 state.json 接续同一日志会话。当前进程 PID={0}" -f $PID)
+        }
+        else {
+            Write-Step ("已从上次进度恢复，继续写入同一日志。当前进程 PID={0}" -f $PID)
+        }
     }
     elseif ((Test-HermesAbsolutePath -Path $InstallLogPath) -or (-not [string]::IsNullOrWhiteSpace($InstallLogSessionId))) {
         Write-Step ("已接续现有安装日志会话。当前进程 PID={0}" -f $PID)
@@ -570,12 +625,31 @@ try {
 
         Write-Phase -Index 1 -Total $totalPhases -Message '收集本机安装选项并保存恢复状态'
         $config = Ensure-InstallSelection
+        $reconciledSnapshot = Sync-HermesStateFromManagedSnapshot -Config $config
+        if ($reconciledSnapshot.StateUpdated) {
+            Write-Step ("已根据当前 WSL 真实状态自动纠正安装进度：{0}" -f $reconciledSnapshot.StateUpdateReason)
+            $completed.Add(("Reconciled stale installer state to {0}." -f $reconciledSnapshot.CanonicalStage))
+        }
+        if ($reconciledSnapshot.CanonicalStage -eq 'success') {
+            Unregister-HermesResume
+            $completed.Add('Detected that the dedicated Hermes environment was already fully usable.')
+            Write-Step '检测到 Hermes 已处于可用状态，本次不再重复执行安装步骤。'
+            return [PSCustomObject]@{
+                Status     = 'success'
+                DistroName = $config.DistroName
+                Username   = $config.Username
+            }
+        }
         Write-Phase -Index 2 -Total $totalPhases -Message '在接触 WSL 之前准备 Windows 侧缓存资源'
         Invoke-Prefetch -ResolvedConfig $config
         Save-HermesState -Stage 'assets-ready' -Config $config -LastResult 'assets-ready'
 
         Write-Phase -Index 3 -Total $totalPhases -Message '准备所选的 WSL 目标环境'
         $prepareResult = Invoke-PrepareTarget -ResolvedConfig $config
+        $postPrepareSnapshot = Sync-HermesStateFromManagedSnapshot -Config $config
+        if ($postPrepareSnapshot.StateUpdated) {
+            Write-Step ("目标环境阶段已与 WSL 真实状态重新对齐：{0}" -f $postPrepareSnapshot.StateUpdateReason)
+        }
         if ($prepareResult.Status -eq 'blocked-reboot') {
             $completed.Add(("已注册重启恢复入口：{0}" -f $prepareResult.ResumeMethod))
             exit 2
@@ -632,24 +706,49 @@ try {
         }
 
         if ($wechatResult.Status -eq 'failed') {
-            $wechatFailure = "Weixin setup failed before Hermes stored any credentials. Exit code: $($wechatResult.ExitCode)"
-            if ($wechatResult.LogTail) {
-                $wechatFailure = "$wechatFailure`nVisible setup window tail:`n$($wechatResult.LogTail)"
+            $hasStructuredFailureSummary = (
+                $wechatResult.PSObject.Properties.Name -contains 'FailureSummary' -and
+                $wechatResult.FailureSummary
+            )
+            $wechatFailure = if ($hasStructuredFailureSummary) {
+                [string]$wechatResult.FailureSummary
+            }
+            else {
+                "Weixin setup failed. Exit code: $($wechatResult.ExitCode)"
+            }
+            if (-not $hasStructuredFailureSummary -and $wechatResult.LogTail) {
+                $wechatFailure = "$wechatFailure`nWeixin setup session log tail:`n$($wechatResult.LogTail)"
             }
             throw $wechatFailure
         }
+
+        $allowRecentWechatSessionSuccess = (
+            $wechatResult.PSObject.Properties.Name -contains 'VerificationMode' -and
+            [string]$wechatResult.VerificationMode -eq 'session-success-only'
+        )
 
         if ($wechatResult.Status -eq 'already-bound') {
             $completed.Add('检测到已有 Weixin 绑定，已跳过重新扫码登录。')
         }
         elseif ($wechatResult.Status -eq 'success') {
-            $completed.Add('已完成原生 Weixin 扫码绑定，并保存账号凭据。')
+            if ($allowRecentWechatSessionSuccess) {
+                $completed.Add('已完成原生 Weixin 扫码绑定，Hermes CLI 已报告成功，正在继续验证 gateway 启动。')
+            }
+            elseif (
+                $wechatResult.PSObject.Properties.Name -contains 'VerificationMode' -and
+                [string]$wechatResult.VerificationMode -eq 'env-only'
+            ) {
+                $completed.Add('已完成原生 Weixin 扫码绑定，并检测到账号凭据已写入 ~/.hermes/.env。')
+            }
+            else {
+                $completed.Add('已完成原生 Weixin 扫码绑定，并保存账号凭据。')
+            }
         }
         else {
             throw "Weixin setup returned an unknown status: $($wechatResult.Status)"
         }
 
-        $gatewayResult = & "$PSScriptRoot\windows-start-gateway.ps1"
+        $gatewayResult = & "$PSScriptRoot\windows-start-gateway.ps1" -AllowRecentWechatSessionSuccess:$allowRecentWechatSessionSuccess
         if ($gatewayResult.Status -eq 'not-configured' -or $gatewayResult.Status -eq 'reauth-required') {
             exit 6
         }

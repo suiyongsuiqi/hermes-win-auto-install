@@ -71,16 +71,20 @@ try {
         Write-Step ("检查本地缓存：{0}。" -f $asset.Name)
         $metadataProbe = Try-GetRemoteFileMetadata -Uri $asset.Url
         $meta = if ($metadataProbe.Success) { $metadataProbe.Metadata } else { $null }
+        $trustedContentLength = Get-TrustedRemoteContentLength -Metadata $meta
         $reuse = $false
 
         if (-not $metadataProbe.Success) {
             Write-Step ("远程元数据获取失败，将按本地缓存优先继续处理 {0}：{1}" -f $asset.Name, $metadataProbe.Error)
             $completed.Add(("远程元数据获取失败，但仍继续处理 {0}：{1}" -f $asset.Name, $metadataProbe.Error))
         }
+        elseif ($null -ne $meta) {
+            Write-Step ("{0} 远程元数据：{1}" -f $asset.Name, (Get-RemoteFileMetadataSummary -Metadata $meta))
+        }
 
         if (Test-Path -LiteralPath $asset.Path) {
             $existingLength = (Get-Item -LiteralPath $asset.Path).Length
-            if ($existingLength -gt 0 -and ($null -eq $meta -or $meta.ContentLength -le 0 -or $existingLength -eq $meta.ContentLength)) {
+            if ($existingLength -gt 0 -and ($trustedContentLength -le 0 -or $existingLength -eq $trustedContentLength)) {
                 $reuse = $true
                 $completed.Add(("已复用现有 {0}：{1}" -f $asset.Name, $asset.Path))
                 Write-Step ("复用已有 {0}：{1}" -f $asset.Name, $asset.Path)
@@ -103,11 +107,14 @@ try {
                 -OutputPath $asset.Path `
                 -Activity $asset.Activity `
                 -StatusLabel $asset.StatusLabel `
-                -TotalBytesHint $(if ($null -ne $meta) { $meta.ContentLength } else { 0 })
+                -TotalBytesHint $trustedContentLength
 
             $downloadedLength = (Get-Item -LiteralPath $asset.Path).Length
-            if ($null -ne $meta -and $meta.ContentLength -gt 0 -and $downloadedLength -ne $meta.ContentLength) {
-                throw ("Downloaded {0} size mismatch. Expected {1} bytes, got {2} bytes." -f $asset.Name, $meta.ContentLength, $downloadedLength)
+            if ($trustedContentLength -gt 0 -and $downloadedLength -ne $trustedContentLength) {
+                throw ("Downloaded {0} size mismatch. Expected {1} bytes, got {2} bytes." -f $asset.Name, $trustedContentLength, $downloadedLength)
+            }
+            if ($null -ne $meta -and $trustedContentLength -le 0) {
+                Write-Step ("{0} 远程元数据未提供可信总大小，跳过下载后严格长度校验。" -f $asset.Name)
             }
 
             $completed.Add(("已将 {0} 下载到 {1}" -f $asset.Name, $asset.Path))

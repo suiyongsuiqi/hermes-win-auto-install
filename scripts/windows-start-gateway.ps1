@@ -1,6 +1,7 @@
 ﻿[CmdletBinding()]
 param(
-    [switch]$FromStartup
+    [switch]$FromStartup,
+    [switch]$AllowRecentWechatSessionSuccess
 )
 
 Set-StrictMode -Version Latest
@@ -71,6 +72,7 @@ try {
     $config = Get-ResolvedInstallConfig
     $state = Get-HermesState
     $replaceRunningGateway = ($null -ne $state -and [string]$state.stage -eq 'wechat-bound')
+    $weixinConfigured = Test-WeixinConfigured -DistroName $config.DistroName -Username $config.Username
     Write-Step '开始执行 Hermes gateway 启动阶段。'
 
     if (-not (Test-WslDistributionHealthy -Name $config.DistroName)) {
@@ -79,7 +81,7 @@ try {
 
     $completed.Add('Confirmed the target distribution is healthy.')
 
-    if (-not (Test-WeixinConfigured -DistroName $config.DistroName -Username $config.Username)) {
+    if (-not $weixinConfigured -and -not $AllowRecentWechatSessionSuccess) {
         Save-HermesState -Stage 'ready-for-wechat' -Config $config -LastResult 'weixin-not-configured'
 
         if ($FromStartup) {
@@ -93,7 +95,12 @@ try {
         }
     }
 
-    $completed.Add('Confirmed that a Weixin binding is already present.')
+    if ($weixinConfigured) {
+        $completed.Add('Confirmed that a Weixin binding is already present.')
+    }
+    else {
+        $completed.Add('Proceeding with gateway startup because the latest Weixin setup session already reported success.')
+    }
 
     if ((Test-HermesGatewayRunning -DistroName $config.DistroName -Username $config.Username) -and -not $replaceRunningGateway) {
         Save-HermesState -Stage 'gateway-running' -Config $config -LastResult 'already-running'

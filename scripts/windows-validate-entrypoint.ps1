@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $entryScripts = @(
+    'scripts/windows-common.ps1',
     'scripts/windows-prefetch-assets.ps1',
     'scripts/windows-install-hermes.ps1',
     'scripts/windows-bootstrap.ps1',
@@ -13,7 +14,8 @@ $entryScripts = @(
     'scripts/windows-enter-key.ps1',
     'scripts/windows-configure-wechat.ps1',
     'scripts/windows-start-gateway.ps1',
-    'scripts/windows-webui.ps1'
+    'scripts/windows-webui.ps1',
+    'scripts/windows-check-status.ps1'
 )
 
 function Write-Step {

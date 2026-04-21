@@ -1,5 +1,7 @@
 ﻿[CmdletBinding()]
-param()
+param(
+    [switch]$AllowUnsafeContinue
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -7,8 +9,40 @@ $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\windows-common.ps1"
 
 $paths = Get-HermesPaths
-$totalPhases = 6
+$totalPhases = 7
 $completed = New-Object System.Collections.Generic.List[string]
+
+function Start-WslBackgroundProcess {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$Operation,
+        [Parameter(Mandatory = $true)][string]$DistroName
+    )
+
+    Ensure-Directory -Path $paths.StateRoot
+    $token = [guid]::NewGuid().ToString('N')
+    $stdoutPath = Join-Path $paths.StateRoot ("wsl-{0}-{1}-stdout.log" -f $Operation, $token)
+    $stderrPath = Join-Path $paths.StateRoot ("wsl-{0}-{1}-stderr.log" -f $Operation, $token)
+    $commandLine = "wsl.exe $(Join-CommandLineArguments -Arguments $Arguments)"
+
+    Write-Step ("正在启动 WSL {0} 进程：{1}" -f $Operation, $commandLine)
+    $process = Start-Process -FilePath 'wsl.exe' `
+        -ArgumentList $Arguments `
+        -PassThru `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $stdoutPath `
+        -RedirectStandardError $stderrPath
+
+    return [PSCustomObject]@{
+        Process     = $process
+        Operation   = $Operation
+        DistroName  = $DistroName
+        Arguments   = $Arguments
+        CommandLine = $commandLine
+        StdOutPath  = $stdoutPath
+        StdErrPath  = $stderrPath
+    }
+}
 
 function Start-WslInstallProcess {
     param(
@@ -23,10 +57,10 @@ function Start-WslInstallProcess {
 
     Ensure-Directory -Path (Split-Path -Parent $installLocation)
 
-    return Start-Process -FilePath 'wsl.exe' `
-        -ArgumentList @('--install', '--from-file', $PackagePath, '--name', $DistroName, '--location', $installLocation, '--no-launch') `
-        -PassThru `
-        -WindowStyle Hidden
+    return Start-WslBackgroundProcess `
+        -Arguments @('--install', '--from-file', $PackagePath, '--name', $DistroName, '--location', $installLocation, '--no-launch') `
+        -Operation 'install' `
+        -DistroName $DistroName
 }
 
 function Start-WslImportProcess {
@@ -42,10 +76,10 @@ function Start-WslImportProcess {
 
     Ensure-Directory -Path (Split-Path -Parent $installLocation)
 
-    return Start-Process -FilePath 'wsl.exe' `
-        -ArgumentList @('--import', $DistroName, $installLocation, $BaseImagePath, '--version', '2') `
-        -PassThru `
-        -WindowStyle Hidden
+    return Start-WslBackgroundProcess `
+        -Arguments @('--import', $DistroName, $installLocation, $BaseImagePath, '--version', '2') `
+        -Operation 'import' `
+        -DistroName $DistroName
 }
 
 function Get-DriveFreeSpaceInfo {
@@ -671,13 +705,657 @@ function Get-UbuntuSourcesHealth {
     }
 }
 
+function Get-BootstrapRuntimeSnapshot {
+    param([Parameter(Mandatory = $true)][string]$DistroName)
+
+    $snapshotCommand = @'
+python3 - <<'PY'
+import glob
+import json
+import os
+import subprocess
+
+
+def read_text(path):
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as handle:
+            return handle.read().strip()
+    except Exception:
+        return ''
+
+
+def read_first_line(path):
+    text = read_text(path)
+    if not text:
+        return ''
+    return text.splitlines()[0].strip()
+
+
+def run(command):
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding='utf-8',
+            errors='replace'
+        )
+        return completed.returncode, completed.stdout.strip()
+    except Exception as exc:
+        return 255, str(exc)
+
+
+def read_json(path):
+    text = read_text(path)
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        return {'_raw': text}
+
+
+def tail_text(path, max_lines):
+    text = read_text(path)
+    if not text:
+        return ''
+    lines = text.splitlines()
+    return '\n'.join(lines[-max_lines:])
+
+
+def get_mtime(path):
+    try:
+        return int(os.path.getmtime(path))
+    except Exception:
+        return 0
+
+
+def get_interesting_processes():
+    rc, output = run(['ps', '-eo', 'args='])
+    if rc != 0 or not output:
+        return []
+
+    interesting = []
+    keywords = [
+        'apt-get update',
+        'apt-get install',
+        ' dpkg',
+        'dpkg ',
+        'python3 -m venv',
+        'uv venv',
+        ' pip ',
+        'uv pip',
+        'npm ',
+        'node ',
+        'cargo ',
+        'gcc ',
+        'g++ ',
+        'cloud-init',
+        'hermes-bootstrap.sh',
+    ]
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lower = f' {line.lower()} '
+        if any(keyword in lower for keyword in keywords):
+            interesting.append(line[:240])
+
+    return interesting[:16]
+
+
+def parse_status_field(text, field_name):
+    prefix = f'{field_name}:'
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith(prefix):
+            return line[len(prefix):].strip()
+    return ''
+
+
+instance_dirs = sorted(glob.glob('/var/lib/cloud/instances/*'))
+instance_dir = instance_dirs[0] if instance_dirs else ''
+sem_dir = os.path.join(instance_dir, 'sem') if instance_dir else ''
+scripts_dir = os.path.join(instance_dir, 'scripts') if instance_dir else ''
+sem_files = []
+if sem_dir and os.path.isdir(sem_dir):
+    sem_files = sorted(os.path.basename(path) for path in glob.glob(os.path.join(sem_dir, '*')))
+
+required_packages_installed = []
+required_packages_missing = []
+for package_name in ['git', 'curl', 'ca-certificates']:
+    rc, output = run(['dpkg-query', '-W', '-f=${Status}\n', package_name])
+    if output.strip() == 'install ok installed':
+        required_packages_installed.append(package_name)
+    else:
+        required_packages_missing.append(package_name)
+
+status_rc, status_output = run(['cloud-init', 'status', '--long'])
+
+payload = {
+    'instance_dir': instance_dir,
+    'sem_files': sem_files,
+    'config_present': os.path.isfile('/var/lib/hermes-bootstrap/config.env'),
+    'bootstrap_script_present': os.path.isfile('/usr/local/bin/hermes-bootstrap.sh'),
+    'runcmd_script_present': os.path.isfile(os.path.join(scripts_dir, 'runcmd')) if scripts_dir else False,
+    'stage': read_first_line('/var/lib/hermes-bootstrap/stage.txt'),
+    'result': read_first_line('/var/lib/hermes-bootstrap/result'),
+    'failed_stage': read_first_line('/var/lib/hermes-bootstrap/failed_stage.txt'),
+    'cloud_init_status_exit_code': status_rc,
+    'cloud_init_status': status_output,
+    'cloud_init_status_state': parse_status_field(status_output, 'status'),
+    'cloud_init_extended_status': parse_status_field(status_output, 'extended_status'),
+    'cloud_init_status_json': read_json('/var/lib/cloud/data/status.json'),
+    'cloud_init_result_json': read_json('/var/lib/cloud/data/result.json'),
+    'required_packages_installed': required_packages_installed,
+    'required_packages_missing': required_packages_missing,
+    'interesting_processes': get_interesting_processes(),
+    'bootstrap_log_mtime_epoch': get_mtime('/var/log/hermes-bootstrap.log'),
+    'cloud_init_output_mtime_epoch': get_mtime('/var/log/cloud-init-output.log'),
+    'bootstrap_log_tail': tail_text('/var/log/hermes-bootstrap.log', 60),
+    'cloud_init_output_tail': tail_text('/var/log/cloud-init-output.log', 60),
+    'snapshot_error': ''
+}
+
+print(json.dumps(payload, ensure_ascii=True))
+PY
+'@
+
+    try {
+        $snapshotJson = Invoke-WslBash -Distro $DistroName -User 'root' -Command $snapshotCommand -TimeoutSeconds 40
+        $trimmedJson = if ($snapshotJson) { [string]$snapshotJson.Trim() } else { '' }
+        if (-not $trimmedJson) {
+            throw 'Bootstrap runtime snapshot returned an empty payload.'
+        }
+
+        return (ConvertFrom-HermesLooseJson -Text $trimmedJson -ContextLabel 'Bootstrap runtime snapshot')
+    }
+    catch {
+        return [PSCustomObject]@{
+            instance_dir                = ''
+            sem_files                   = @()
+            config_present              = $false
+            bootstrap_script_present    = $false
+            runcmd_script_present       = $false
+            stage                       = ''
+            result                      = ''
+            failed_stage                = ''
+            cloud_init_status_exit_code = -1
+            cloud_init_status           = ''
+            cloud_init_status_state     = ''
+            cloud_init_extended_status  = ''
+            cloud_init_status_json      = $null
+            cloud_init_result_json      = $null
+            required_packages_installed = @()
+            required_packages_missing   = @()
+            interesting_processes       = @()
+            bootstrap_log_mtime_epoch   = 0
+            cloud_init_output_mtime_epoch = 0
+            bootstrap_log_tail          = ''
+            cloud_init_output_tail      = ''
+            snapshot_error              = $_.Exception.Message
+        }
+    }
+}
+
+function ConvertFrom-HermesLooseJson {
+    param(
+        [Parameter(Mandatory = $true)][string]$Text,
+        [string]$ContextLabel = 'JSON'
+    )
+
+    $trimmed = [string]$Text.Trim()
+    if (-not $trimmed) {
+        throw "$ContextLabel payload is empty."
+    }
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $candidates.Add($trimmed)
+
+    foreach ($line in ($trimmed -split "(`r`n|`n|`r)")) {
+        $lineTrimmed = [string]$line.Trim()
+        if ($lineTrimmed.StartsWith('{') -and $lineTrimmed.EndsWith('}')) {
+            $candidates.Add($lineTrimmed)
+        }
+    }
+
+    $firstBrace = $trimmed.IndexOf('{')
+    $lastBrace = $trimmed.LastIndexOf('}')
+    if ($firstBrace -ge 0 -and $lastBrace -gt $firstBrace) {
+        $candidates.Add($trimmed.Substring($firstBrace, $lastBrace - $firstBrace + 1))
+    }
+
+    foreach ($candidate in ($candidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
+        try {
+            return ($candidate | ConvertFrom-Json -ErrorAction Stop)
+        }
+        catch {
+        }
+    }
+
+    $tail = Get-TextTail -Text $trimmed -MaxChars 2000
+    throw "$ContextLabel JSON parse failed. Raw output tail:`n$tail"
+}
+
+function Get-BootstrapActivityInfo {
+    param([Parameter(Mandatory = $true)]$Snapshot)
+
+    $trimmedStage = if ($Snapshot.stage) { [string]$Snapshot.stage.Trim() } else { '' }
+    $interestingProcesses = @(
+        @($Snapshot.interesting_processes) |
+            ForEach-Object { [string]$_ } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    $signalText = @(
+        $interestingProcesses -join "`n",
+        [string]$Snapshot.bootstrap_log_tail,
+        [string]$Snapshot.cloud_init_output_tail
+    ) -join "`n"
+    $signalText = $signalText.ToLowerInvariant()
+
+    $phase = if ($trimmedStage) { $trimmedStage } else { 'bootstrap' }
+    if ($trimmedStage -eq 'install-hermes') {
+        if ($signalText -match 'apt-get update| hit:| get:| fetched | reading package lists') {
+            $phase = 'apt-update'
+        }
+        elseif ($signalText -match 'apt-get install| dpkg |unpacking |setting up ') {
+            $phase = 'apt-install'
+        }
+        elseif ($signalText -match 'python3 -m venv|uv venv|\.venv|virtual environment') {
+            $phase = 'venv-create'
+        }
+        elseif ($signalText -match 'pip install|uv pip install|collecting ') {
+            $phase = 'python-deps'
+        }
+        elseif ($signalText -match 'npm |node |pnpm ') {
+            $phase = 'node-deps'
+        }
+        elseif ($signalText -match 'hermes doctor|hermes version|hermes status') {
+            $phase = 'hermes-verify'
+        }
+    }
+
+    $latestActivityEpoch = 0L
+    foreach ($epoch in @($Snapshot.bootstrap_log_mtime_epoch, $Snapshot.cloud_init_output_mtime_epoch)) {
+        $parsedEpoch = 0L
+        [long]::TryParse([string]$epoch, [ref]$parsedEpoch) | Out-Null
+        if ($parsedEpoch -gt $latestActivityEpoch) {
+            $latestActivityEpoch = $parsedEpoch
+        }
+    }
+
+    $idleSeconds = 0
+    if ($latestActivityEpoch -gt 0) {
+        $nowEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $idleSeconds = [Math]::Max(0, [int]($nowEpoch - $latestActivityEpoch))
+    }
+
+    $cloudInitState = if ($Snapshot.cloud_init_status_state) { [string]$Snapshot.cloud_init_status_state.Trim() } else { '' }
+    $staleThresholdSeconds = if ($cloudInitState -eq 'running') { 900 } else { 300 }
+    $isStale = ($latestActivityEpoch -gt 0 -and $interestingProcesses.Count -eq 0 -and $idleSeconds -ge $staleThresholdSeconds)
+
+    return [PSCustomObject]@{
+        Phase               = $phase
+        InterestingProcesses = $interestingProcesses
+        LatestActivityEpoch = $latestActivityEpoch
+        IdleSeconds         = $idleSeconds
+        IsStale             = $isStale
+    }
+}
+
+function Get-BootstrapRuntimeState {
+    param([Parameter(Mandatory = $true)]$Snapshot)
+
+    $result = if ($Snapshot.result) { [string]$Snapshot.result.Trim() } else { '' }
+    $stage = if ($Snapshot.stage) { [string]$Snapshot.stage.Trim() } else { '' }
+    $failedStage = if ($Snapshot.failed_stage) { [string]$Snapshot.failed_stage.Trim() } else { '' }
+    $statusState = if ($Snapshot.cloud_init_status_state) { [string]$Snapshot.cloud_init_status_state.Trim() } else { '' }
+    $extendedStatus = if ($Snapshot.cloud_init_extended_status) { [string]$Snapshot.cloud_init_extended_status.Trim() } else { '' }
+    $configPresent = [bool]$Snapshot.config_present
+    $bootstrapScriptPresent = [bool]$Snapshot.bootstrap_script_present
+    $runcmdScriptPresent = [bool]$Snapshot.runcmd_script_present
+    $semFiles = @($Snapshot.sem_files)
+    $missingPackages = @($Snapshot.required_packages_missing)
+    $activityInfo = Get-BootstrapActivityInfo -Snapshot $Snapshot
+
+    if ($Snapshot.snapshot_error) {
+        return [PSCustomObject]@{
+            State   = 'running'
+            Summary = ("Snapshot unavailable: {0}" -f $Snapshot.snapshot_error)
+        }
+    }
+
+    if ($result -eq 'ready_for_key') {
+        return [PSCustomObject]@{
+            State   = 'ready'
+            Summary = 'ready_for_key was recorded.'
+        }
+    }
+
+    if ($result -like 'failed:*') {
+        return [PSCustomObject]@{
+            State   = 'failed'
+            Summary = ("Bootstrap script recorded an explicit failure result: {0}" -f $result)
+        }
+    }
+
+    if ($failedStage) {
+        return [PSCustomObject]@{
+            State   = 'failed'
+            Summary = ("failed_stage.txt recorded {0}" -f $failedStage)
+        }
+    }
+
+    if (($configPresent -and -not $bootstrapScriptPresent) -or ($bootstrapScriptPresent -and -not $configPresent)) {
+        return [PSCustomObject]@{
+            State   = 'inconsistent'
+            Summary = 'Bootstrap assets are incomplete: config.env and hermes-bootstrap.sh are out of sync.'
+        }
+    }
+
+    if ($configPresent -and $bootstrapScriptPresent -and ($semFiles -contains 'config_runcmd') -and -not $runcmdScriptPresent) {
+        return [PSCustomObject]@{
+            State   = 'inconsistent'
+            Summary = 'cloud-init marked config_runcmd complete, but the generated scripts/runcmd payload is missing.'
+        }
+    }
+
+    if ($statusState -eq 'error') {
+        return [PSCustomObject]@{
+            State   = 'failed'
+            Summary = 'cloud-init reports status=error.'
+        }
+    }
+
+    if ($statusState -eq 'running') {
+        if ($activityInfo.IsStale) {
+            return [PSCustomObject]@{
+                State   = 'stale-running'
+                Summary = ("cloud-init still reports running, but no interesting worker process or log activity was observed for {0} seconds." -f $activityInfo.IdleSeconds)
+            }
+        }
+
+        return [PSCustomObject]@{
+            State   = 'running'
+            Summary = 'cloud-init is still running.'
+        }
+    }
+
+    if ($configPresent -and $bootstrapScriptPresent -and -not $result) {
+        if ($activityInfo.IsStale) {
+            return [PSCustomObject]@{
+                State   = 'stale-running'
+                Summary = ("Bootstrap assets exist, but no result, worker process, or fresh log activity has been observed for {0} seconds." -f $activityInfo.IdleSeconds)
+            }
+        }
+
+        $summaryParts = @('Bootstrap assets exist, but ready_for_key has not been recorded yet.')
+        if ($statusState) {
+            $summaryParts += ("cloud-init status is {0}" -f $statusState)
+        }
+        if ($extendedStatus) {
+            $summaryParts += ("extended_status is {0}" -f $extendedStatus)
+        }
+        if ($missingPackages.Count -gt 0) {
+            $summaryParts += ("required packages missing: {0}" -f ($missingPackages -join ', '))
+        }
+
+        return [PSCustomObject]@{
+            State   = 'recoverable-interrupted'
+            Summary = ($summaryParts -join '; ')
+        }
+    }
+
+    if ($stage -or $semFiles.Count -gt 0) {
+        return [PSCustomObject]@{
+            State   = 'running'
+            Summary = 'cloud-init metadata is present and bootstrap is still converging.'
+        }
+    }
+
+    return [PSCustomObject]@{
+        State   = 'running'
+        Summary = 'bootstrap has not produced any stage markers yet.'
+    }
+}
+
+function Format-BootstrapRuntimeSummary {
+    param(
+        [Parameter(Mandatory = $true)]$Snapshot,
+        [Parameter(Mandatory = $true)]$StateInfo
+    )
+
+    $parts = New-Object System.Collections.Generic.List[string]
+    $activityInfo = Get-BootstrapActivityInfo -Snapshot $Snapshot
+    $parts.Add(("state={0}" -f $StateInfo.State))
+
+    if ($Snapshot.stage) {
+        $parts.Add(("stage={0}" -f ([string]$Snapshot.stage).Trim()))
+    }
+    if ($activityInfo.Phase) {
+        $parts.Add(("activity={0}" -f $activityInfo.Phase))
+    }
+    if ($Snapshot.result) {
+        $parts.Add(("result={0}" -f ([string]$Snapshot.result).Trim()))
+    }
+    if ($Snapshot.failed_stage) {
+        $parts.Add(("failed_stage={0}" -f ([string]$Snapshot.failed_stage).Trim()))
+    }
+    if ($Snapshot.cloud_init_status_state) {
+        $parts.Add(("cloud-init={0}" -f ([string]$Snapshot.cloud_init_status_state).Trim()))
+    }
+    if ($Snapshot.cloud_init_extended_status) {
+        $parts.Add(("extended={0}" -f ([string]$Snapshot.cloud_init_extended_status).Trim()))
+    }
+
+    $missingPackages = @($Snapshot.required_packages_missing)
+    if ($missingPackages.Count -gt 0) {
+        $parts.Add(("missing_packages={0}" -f ($missingPackages -join ',')))
+    }
+    if ($activityInfo.InterestingProcesses.Count -gt 0) {
+        $parts.Add(("active_processes={0}" -f $activityInfo.InterestingProcesses.Count))
+    }
+    if ($activityInfo.IdleSeconds -gt 0) {
+        $parts.Add(("log_idle_s={0}" -f $activityInfo.IdleSeconds))
+    }
+
+    if ($StateInfo.Summary) {
+        $parts.Add($StateInfo.Summary)
+    }
+
+    return ($parts -join '; ')
+}
+
+function Start-BootstrapLaunchProcess {
+    param([Parameter(Mandatory = $true)][string]$DistroName)
+
+    $bootstrapCommand = @'
+set -euo pipefail
+
+cloud-init modules --mode config
+cloud-init modules --mode final
+
+while [ ! -f /var/lib/hermes-bootstrap/result ]; do
+  status_output="$(cloud-init status --long 2>/dev/null || true)"
+  if printf '%s\n' "$status_output" | grep -q '^status: error'; then
+    exit 1
+  fi
+  if printf '%s\n' "$status_output" | grep -q '^status: done'; then
+    echo 'cloud-init reached status=done before Hermes bootstrap wrote result' >&2
+    exit 2
+  fi
+  sleep 2
+done
+'@
+
+    return Start-WslBackgroundProcess `
+        -Arguments @('-d', $DistroName, '-u', 'root', '--', 'bash', '-lc', $bootstrapCommand) `
+        -Operation 'bootstrap' `
+        -DistroName $DistroName
+}
+
+function Invoke-BootstrapRecoveryPreparation {
+    param(
+        [Parameter(Mandatory = $true)]$ResolvedConfig,
+        [Parameter(Mandatory = $true)]$Snapshot
+    )
+
+    $configPresent = [bool]$Snapshot.config_present
+    $bootstrapScriptPresent = [bool]$Snapshot.bootstrap_script_present
+    $runcmdScriptPresent = [bool]$Snapshot.runcmd_script_present
+    $semFiles = @($Snapshot.sem_files)
+    $missingPackages = @($Snapshot.required_packages_missing)
+    $result = if ($Snapshot.result) { [string]$Snapshot.result.Trim() } else { '' }
+
+    if ($result -eq 'ready_for_key') {
+        return [PSCustomObject]@{
+            Status            = 'ready'
+            Message           = 'ready_for_key is already present.'
+            MissingPackages   = @()
+            ResetPackageStage = $false
+        }
+    }
+
+    if (($configPresent -and -not $bootstrapScriptPresent) -or ($bootstrapScriptPresent -and -not $configPresent)) {
+        return [PSCustomObject]@{
+            Status            = 'inconsistent'
+            Message           = 'Bootstrap assets are incomplete: config.env and hermes-bootstrap.sh must either both exist or both be absent.'
+            MissingPackages   = $missingPackages
+            ResetPackageStage = $false
+        }
+    }
+
+    if ($configPresent -and $bootstrapScriptPresent -and ($semFiles -contains 'config_runcmd') -and -not $runcmdScriptPresent) {
+        return [PSCustomObject]@{
+            Status            = 'inconsistent'
+            Message           = 'cloud-init recorded config_runcmd, but /var/lib/cloud/instances/*/scripts/runcmd is missing.'
+            MissingPackages   = $missingPackages
+            ResetPackageStage = $false
+        }
+    }
+
+    if (-not $configPresent -and -not $bootstrapScriptPresent) {
+        return [PSCustomObject]@{
+            Status            = 'not-needed'
+            Message           = 'No bootstrap assets exist yet; proceed with a normal bootstrap launch.'
+            MissingPackages   = @()
+            ResetPackageStage = $false
+        }
+    }
+
+    $resetPackageStage = $missingPackages.Count -gt 0
+    $repairCommand = @'
+set -euo pipefail
+
+find /var/lib/cloud/instances -path '*/sem/config_scripts_user' -type f -delete 2>/dev/null || true
+find /var/lib/cloud/instances -path '*/sem/config_scripts_per_instance' -type f -delete 2>/dev/null || true
+
+if [ "__RESET_PACKAGE_STAGE__" = "1" ]; then
+  find /var/lib/cloud/instances -path '*/sem/config_package_update_upgrade_install' -type f -delete 2>/dev/null || true
+  find /var/lib/cloud/instances -path '*/sem/update_sources' -type f -delete 2>/dev/null || true
+fi
+
+rm -f /var/lib/hermes-bootstrap/result /var/lib/hermes-bootstrap/failed_stage.txt
+'@
+    $repairCommand = $repairCommand.Replace('__RESET_PACKAGE_STAGE__', $(if ($resetPackageStage) { '1' } else { '0' }))
+
+    Invoke-WslBash `
+        -Distro $ResolvedConfig.DistroName `
+        -User 'root' `
+        -Command $repairCommand `
+        -TimeoutSeconds 60 `
+        -ProgressMessage '正在准备恢复被中断的 Hermes bootstrap。' `
+        -RequireSuccess | Out-Null
+
+    $message = if ($resetPackageStage) {
+        "Reset cloud-init final semaphores and package semaphores because required packages are missing: $($missingPackages -join ', ')."
+    }
+    else {
+        'Reset cloud-init final semaphores for a resumed scripts-user run.'
+    }
+
+    return [PSCustomObject]@{
+        Status            = 'prepared'
+        Message           = $message
+        MissingPackages   = $missingPackages
+        ResetPackageStage = $resetPackageStage
+    }
+}
+
 function Get-BootstrapDiagnostics {
     param(
         [Parameter(Mandatory = $true)][string]$DistroName,
-        [switch]$IncludeCloudInit
+        [switch]$IncludeCloudInit,
+        $Snapshot = $null,
+        $LaunchHandle = $null
     )
 
     $details = @()
+    if ($null -eq $Snapshot) {
+        $Snapshot = Get-BootstrapRuntimeSnapshot -DistroName $DistroName
+    }
+
+    if ($null -ne $Snapshot) {
+        $runtimeState = Get-BootstrapRuntimeState -Snapshot $Snapshot
+        $activityInfo = Get-BootstrapActivityInfo -Snapshot $Snapshot
+        $details += ("Bootstrap runtime: {0}" -f (Format-BootstrapRuntimeSummary -Snapshot $Snapshot -StateInfo $runtimeState))
+        if ($Snapshot.instance_dir) {
+            $details += ("cloud-init instance dir: {0}" -f ([string]$Snapshot.instance_dir).Trim())
+        }
+        $semFiles = @($Snapshot.sem_files)
+        if ($semFiles.Count -gt 0) {
+            $details += ("cloud-init semaphores: {0}" -f ($semFiles -join ', '))
+        }
+        if ($Snapshot.cloud_init_status) {
+            $details += "cloud-init status --long:`n$(([string]$Snapshot.cloud_init_status).TrimEnd())"
+        }
+        if ($null -ne $Snapshot.cloud_init_status_json) {
+            $details += ("cloud-init status.json: {0}" -f (($Snapshot.cloud_init_status_json | ConvertTo-Json -Depth 8 -Compress)))
+        }
+        if ($null -ne $Snapshot.cloud_init_result_json) {
+            $details += ("cloud-init result.json: {0}" -f (($Snapshot.cloud_init_result_json | ConvertTo-Json -Depth 8 -Compress)))
+        }
+        $missingPackages = @($Snapshot.required_packages_missing)
+        if ($missingPackages.Count -gt 0) {
+            $details += ("Missing required bootstrap packages: {0}" -f ($missingPackages -join ', '))
+        }
+        if ($Snapshot.snapshot_error) {
+            $details += ("Snapshot error: {0}" -f $Snapshot.snapshot_error)
+        }
+        if ($activityInfo.InterestingProcesses.Count -gt 0) {
+            $details += ("Interesting worker processes: {0}" -f ($activityInfo.InterestingProcesses -join ' | '))
+        }
+        if ($activityInfo.IdleSeconds -gt 0) {
+            $details += ("Seconds since last bootstrap-related log activity: {0}" -f $activityInfo.IdleSeconds)
+        }
+        if ($Snapshot.bootstrap_log_tail) {
+            $details += "Bootstrap runtime log tail:`n$(([string]$Snapshot.bootstrap_log_tail).TrimEnd())"
+        }
+        if ($Snapshot.cloud_init_output_tail) {
+            $details += "cloud-init-output runtime tail:`n$(([string]$Snapshot.cloud_init_output_tail).TrimEnd())"
+        }
+    }
+
+    if ($null -ne $LaunchHandle) {
+        $launchExit = if ($LaunchHandle.Process.HasExited) { $LaunchHandle.Process.ExitCode } else { 'running' }
+        $details += ("Bootstrap launcher: exit={0}; command={1}" -f $launchExit, $LaunchHandle.CommandLine)
+        if (Test-Path -LiteralPath $LaunchHandle.StdOutPath) {
+            $stdoutText = Get-Content -Raw -LiteralPath $LaunchHandle.StdOutPath
+            $stdoutTail = Get-TextTail -Text $stdoutText -MaxChars 2500
+            if ($stdoutTail) {
+                $details += "Bootstrap launcher stdout:`n$stdoutTail"
+            }
+        }
+        if (Test-Path -LiteralPath $LaunchHandle.StdErrPath) {
+            $stderrText = Get-Content -Raw -LiteralPath $LaunchHandle.StdErrPath
+            $stderrTail = Get-TextTail -Text $stderrText -MaxChars 2500
+            if ($stderrTail) {
+                $details += "Bootstrap launcher stderr:`n$stderrTail"
+            }
+        }
+    }
+
     $sourcesHealth = Get-UbuntuSourcesHealth -DistroName $DistroName
     $details += "APT source health: $($sourcesHealth.Status)"
     if ($sourcesHealth.Detail) {
@@ -687,13 +1365,15 @@ function Get-BootstrapDiagnostics {
         $details += "ubuntu.sources:`n$($sourcesHealth.Content)"
     }
 
-    try {
-        $bootstrapLogTail = Invoke-WslBash -Distro $DistroName -User 'root' -Command 'tail -n 80 /var/log/hermes-bootstrap.log 2>/dev/null || true' -TimeoutSeconds 20
-        if ($bootstrapLogTail) {
-            $details += "hermes-bootstrap.log:`n$($bootstrapLogTail.TrimEnd())"
+    if (-not $Snapshot.bootstrap_log_tail) {
+        try {
+            $bootstrapLogTail = Invoke-WslBash -Distro $DistroName -User 'root' -Command 'tail -n 80 /var/log/hermes-bootstrap.log 2>/dev/null || true' -TimeoutSeconds 20
+            if ($bootstrapLogTail) {
+                $details += "hermes-bootstrap.log:`n$($bootstrapLogTail.TrimEnd())"
+            }
         }
-    }
-    catch {
+        catch {
+        }
     }
 
     if ($IncludeCloudInit) {
@@ -704,6 +1384,17 @@ function Get-BootstrapDiagnostics {
             }
         }
         catch {
+        }
+
+        if (-not $Snapshot.cloud_init_output_tail) {
+            try {
+                $cloudInitOutputTail = Invoke-WslBash -Distro $DistroName -User 'root' -Command 'tail -n 120 /var/log/cloud-init-output.log 2>/dev/null || true' -TimeoutSeconds 20
+                if ($cloudInitOutputTail) {
+                    $details += "cloud-init-output.log:`n$($cloudInitOutputTail.TrimEnd())"
+                }
+            }
+            catch {
+            }
         }
     }
 
@@ -1262,7 +1953,7 @@ runcmd:
 
 function Wait-ForDistroRegistration {
     param(
-        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
+        [Parameter(Mandatory = $true)]$Handle,
         [Parameter(Mandatory = $true)][string]$DistroName,
         [int]$SoftTimeoutMinutes = 10,
         [int]$HardTimeoutMinutes = 30
@@ -1277,13 +1968,30 @@ function Wait-ForDistroRegistration {
         $distroExists = Test-WslDistributionExists -Name $DistroName
         $wslProcesses = @(Get-Process | Where-Object { $_.ProcessName -like 'wsl*' })
 
-        if ($distroExists -and $Process.HasExited) {
-            Write-Step "WSL 发行版 $DistroName 已注册，导入进程也已退出。"
+        if ($distroExists -and $Handle.Process.HasExited) {
+            Write-Step "WSL 发行版 $DistroName 已注册，$($Handle.Operation) 进程也已退出。"
             return
         }
 
-        if (-not $distroExists -and $Process.HasExited) {
-            throw "WSL import exited but distribution $DistroName was not registered."
+        if (-not $distroExists -and $Handle.Process.HasExited) {
+            $stdout = if (Test-Path -LiteralPath $Handle.StdOutPath) { Get-Content -Raw -LiteralPath $Handle.StdOutPath } else { '' }
+            $stderr = if (Test-Path -LiteralPath $Handle.StdErrPath) { Get-Content -Raw -LiteralPath $Handle.StdErrPath } else { '' }
+            $combined = ConvertTo-HermesTrimmedText -Value ((@($stdout, $stderr) | Where-Object { $_ }) -join [Environment]::NewLine)
+            $outputTail = Get-TextTail -Text $combined -MaxChars 4000
+            if ($outputTail) {
+                throw ("WSL {0} exited with code {1} before distribution {2} was registered.`nCommand: {3}`nOutput:`n{4}" -f `
+                    $Handle.Operation,
+                    $Handle.Process.ExitCode,
+                    $DistroName,
+                    $Handle.CommandLine,
+                    $outputTail)
+            }
+
+            throw ("WSL {0} exited with code {1} before distribution {2} was registered.`nCommand: {3}" -f `
+                $Handle.Operation,
+                $Handle.Process.ExitCode,
+                $DistroName,
+                $Handle.CommandLine)
         }
 
         if ($elapsed -ge $hard) {
@@ -1292,7 +2000,24 @@ function Wait-ForDistroRegistration {
                 return
             }
             & wsl.exe --shutdown 2>$null | Out-Null
-            throw "WSL import exceeded $HardTimeoutMinutes minutes without registering the distribution."
+            $stdout = if (Test-Path -LiteralPath $Handle.StdOutPath) { Get-Content -Raw -LiteralPath $Handle.StdOutPath } else { '' }
+            $stderr = if (Test-Path -LiteralPath $Handle.StdErrPath) { Get-Content -Raw -LiteralPath $Handle.StdErrPath } else { '' }
+            $combined = ConvertTo-HermesTrimmedText -Value ((@($stdout, $stderr) | Where-Object { $_ }) -join [Environment]::NewLine)
+            $outputTail = Get-TextTail -Text $combined -MaxChars 4000
+            if ($outputTail) {
+                throw ("WSL {0} exceeded {1} minutes without registering distribution {2}.`nCommand: {3}`nOutput:`n{4}" -f `
+                    $Handle.Operation,
+                    $HardTimeoutMinutes,
+                    $DistroName,
+                    $Handle.CommandLine,
+                    $outputTail)
+            }
+
+            throw ("WSL {0} exceeded {1} minutes without registering distribution {2}.`nCommand: {3}" -f `
+                $Handle.Operation,
+                $HardTimeoutMinutes,
+                $DistroName,
+                $Handle.CommandLine)
         }
 
         if ($elapsed -ge $soft) {
@@ -1306,8 +2031,96 @@ function Wait-ForDistroRegistration {
         }
 
         Start-Sleep -Seconds 15
-        $Process.Refresh()
+        $Handle.Process.Refresh()
     }
+}
+
+function Invoke-BlockedRebootFlow {
+    param(
+        [Parameter(Mandatory = $true)]$ResolvedConfig,
+        [string]$Notes = 'Waiting for Windows reboot to resume setup.',
+        [string]$LastResult = 'blocked-reboot'
+    )
+
+    $resumeMethod = Register-HermesResume
+    Save-HermesState -Stage 'reboot-required' -Config $ResolvedConfig -ResumeMethod $resumeMethod -Notes $Notes -LastResult $LastResult
+    $resumeMethodLabel = if ($resumeMethod -eq 'runonce') { 'RunOnce' } else { $resumeMethod }
+    Write-Step "检测到 Windows 需要重启，已注册一次性恢复入口（$resumeMethodLabel）。"
+    $userChoice = Show-HermesRebootRequiredDialog -ResumeMethod $resumeMethodLabel
+    if ($userChoice -eq 'restart-now') {
+        Write-Step '用户选择立即重启，Windows 即将重启。'
+        & shutdown.exe /r /t 0 | Out-Null
+    }
+    else {
+        Write-Step '用户选择稍后手动重启。'
+    }
+
+    return [PSCustomObject]@{
+        Status       = 'blocked-reboot'
+        ResumeMethod = $resumeMethod
+        UserChoice   = $userChoice
+        DistroName   = $ResolvedConfig.DistroName
+        Username     = $ResolvedConfig.Username
+    }
+}
+
+function Resolve-WslHostReadiness {
+    param(
+        [Parameter(Mandatory = $true)]$ResolvedConfig,
+        [Parameter(Mandatory = $true)][bool]$UsingPrebuiltBaseImage,
+        [bool]$AllowUnsafeContinue = $false
+    )
+
+    Save-HermesState -Stage 'probe-running' -Config $ResolvedConfig -LastResult 'probe-running'
+    $probe = Invoke-WslCapabilityProbe -Config $ResolvedConfig -UsingPrebuiltBaseImage:$UsingPrebuiltBaseImage
+    Write-WslProbeDiagnostics -ProbeResult $probe
+
+    if ($probe.FailureClass -eq 'healthy') {
+        Save-HermesState -Stage 'wsl-ready' -Config $ResolvedConfig -LastResult 'probe-healthy'
+        return [PSCustomObject]@{
+            Status           = 'ready'
+            ProbeResult      = $probe
+            ContinuationMode = 'normal'
+            ActionResults    = @()
+        }
+    }
+
+    Save-HermesState -Stage 'probe-blocked' -Config $ResolvedConfig -Notes $probe.Summary -LastResult $probe.FailureClass
+    if ($probe.FailureClass -eq 'reboot-required') {
+        return Invoke-BlockedRebootFlow -ResolvedConfig $ResolvedConfig -Notes $probe.Summary -LastResult $probe.FailureClass
+    }
+
+    Save-HermesState -Stage 'repair-running' -Config $ResolvedConfig -Notes $probe.Summary -LastResult $probe.FailureClass
+    $repairResult = Invoke-WslRepairFlow `
+        -Config $ResolvedConfig `
+        -ProbeResult $probe `
+        -UsingPrebuiltBaseImage:$UsingPrebuiltBaseImage `
+        -AllowUnsafeContinue:$AllowUnsafeContinue
+
+    if ($repairResult.Status -eq 'ready') {
+        Save-HermesState -Stage 'repair-complete' -Config $ResolvedConfig -Notes $repairResult.Message -LastResult 'repair-complete'
+        return [PSCustomObject]@{
+            Status           = 'ready'
+            ProbeResult      = $repairResult.ProbeResult
+            ContinuationMode = 'repaired'
+            ActionResults    = $repairResult.ActionResults
+        }
+    }
+    if ($repairResult.Status -eq 'unsafe-continue') {
+        Save-HermesState -Stage 'repair-complete' -Config $ResolvedConfig -Notes $repairResult.Message -LastResult 'unsafe-continue'
+        return [PSCustomObject]@{
+            Status           = 'ready'
+            ProbeResult      = $repairResult.ProbeResult
+            ContinuationMode = 'unsafe-continue'
+            ActionResults    = $repairResult.ActionResults
+        }
+    }
+    if ($repairResult.Status -eq 'blocked-reboot') {
+        return Invoke-BlockedRebootFlow -ResolvedConfig $ResolvedConfig -Notes $repairResult.Message -LastResult $repairResult.FailureClass
+    }
+
+    Save-HermesState -Stage 'repair-required' -Config $ResolvedConfig -Notes $repairResult.Message -LastResult $repairResult.FailureClass
+    throw ("WSL preflight blocked installation: {0}" -f $repairResult.Message)
 }
 
 function Wait-ForBootstrap {
@@ -1318,111 +2131,164 @@ function Wait-ForBootstrap {
     )
 
     $DistroName = $ResolvedConfig.DistroName
-
-    $existingResult = ''
-    try {
-        $existingResult = Invoke-WslBash -Distro $DistroName -User 'root' -Command 'cat /var/lib/hermes-bootstrap/result 2>/dev/null || true' -TimeoutSeconds 20
-    }
-    catch {
-        $existingResult = ''
-    }
-
-    if ($existingResult -eq 'ready_for_key') {
+    $initialSnapshot = Get-BootstrapRuntimeSnapshot -DistroName $DistroName
+    $initialState = Get-BootstrapRuntimeState -Snapshot $initialSnapshot
+    if ($initialState.State -eq 'ready') {
         Write-Step 'bootstrap 结果已存在，复用当前的 ready_for_key 状态。'
         return
     }
 
-    $bootstrapCommand = @'
-set -euo pipefail
+    if ($initialState.State -eq 'failed') {
+        $diagnostics = Get-BootstrapDiagnostics -DistroName $DistroName -Snapshot $initialSnapshot -IncludeCloudInit
+        throw "Bootstrap already contains an explicit failure state before retry.`n$diagnostics"
+    }
 
-if [ -f /var/lib/hermes-bootstrap/result ]; then
-  exit 0
-fi
+    $recoveryPreparation = Invoke-BootstrapRecoveryPreparation -ResolvedConfig $ResolvedConfig -Snapshot $initialSnapshot
+    if ($recoveryPreparation.Status -eq 'ready') {
+        Write-Step 'bootstrap 结果已存在，复用当前的 ready_for_key 状态。'
+        return
+    }
+    if ($recoveryPreparation.Status -eq 'inconsistent') {
+        $diagnostics = Get-BootstrapDiagnostics -DistroName $DistroName -Snapshot $initialSnapshot -IncludeCloudInit
+        throw ("Bootstrap cannot be resumed because the managed distro is inconsistent. {0}`n{1}" -f $recoveryPreparation.Message, $diagnostics)
+    }
+    if ($recoveryPreparation.Status -eq 'prepared') {
+        Write-Step $recoveryPreparation.Message
+    }
 
-cloud-init modules --mode config
-rm -f /var/lib/cloud/instances/*/sem/config_scripts_user
-rm -f /var/lib/cloud/instances/*/sem/config_scripts_per_instance
-cloud-init modules --mode final
-
-while [ ! -f /var/lib/hermes-bootstrap/result ]; do
-  sleep 2
-done
-'@
-
-    $launchProcess = Start-Process -FilePath 'wsl.exe' `
-        -ArgumentList @('-d', $DistroName, '-u', 'root', '--', 'bash', '-lc', $bootstrapCommand) `
-        -PassThru `
-        -WindowStyle Hidden
-
+    $launchHandle = Start-BootstrapLaunchProcess -DistroName $DistroName
     $start = Get-Date
     $soft = [TimeSpan]::FromMinutes($SoftTimeoutMinutes)
     $hard = [TimeSpan]::FromMinutes($HardTimeoutMinutes)
+    $restartCount = 0
+    $maxRestartCount = 2
+    $lastFingerprint = ''
+    $lastProgressAt = $start
 
     while ($true) {
+        $launchHandle.Process.Refresh()
         $elapsed = (Get-Date) - $start
-        $stage = ''
-        $result = ''
-        $trimmedStage = ''
-
-        try {
-            $stage = Invoke-WslBash -Distro $DistroName -User 'root' -Command 'cat /var/lib/hermes-bootstrap/stage.txt 2>/dev/null || true' -TimeoutSeconds 20
-            $result = Invoke-WslBash -Distro $DistroName -User 'root' -Command 'cat /var/lib/hermes-bootstrap/result 2>/dev/null || true' -TimeoutSeconds 20
+        $snapshot = Get-BootstrapRuntimeSnapshot -DistroName $DistroName
+        $runtimeState = Get-BootstrapRuntimeState -Snapshot $snapshot
+        $activityInfo = Get-BootstrapActivityInfo -Snapshot $snapshot
+        $runtimeSummary = Format-BootstrapRuntimeSummary -Snapshot $snapshot -StateInfo $runtimeState
+        $trimmedStage = if ($snapshot.stage) { [string]$snapshot.stage.Trim() } else { '' }
+        $trimmedResult = if ($snapshot.result) { [string]$snapshot.result.Trim() } else { '' }
+        $stateStage = if ($trimmedStage) { $trimmedStage } elseif ($runtimeState.State -eq 'recoverable-interrupted') { 'bootstrap-recovering' } else { 'distro-ready' }
+        $stateLastResult = if ($runtimeState.State -eq 'stale-running') {
+            'bootstrap-stale-running'
         }
-        catch {
-            $stage = ''
-            $result = ''
+        elseif ($activityInfo.Phase -and $runtimeState.State -in @('running', 'recoverable-interrupted')) {
+            "bootstrap-$($activityInfo.Phase)"
         }
+        else {
+            "bootstrap-$($runtimeState.State)"
+        }
+        Save-HermesState -Stage $stateStage -Config $ResolvedConfig -LastResult $stateLastResult
 
-        $trimmedStage = if ($stage) { [string]$stage.Trim() } else { '' }
-        $stateStage = if ($stage) { [string]$stage.Trim() } else { 'distro-ready' }
-        Save-HermesState -Stage $stateStage -Config $ResolvedConfig -LastResult 'bootstrap-running'
+        $fingerprint = @(
+            $trimmedStage,
+            $trimmedResult,
+            $(if ($snapshot.failed_stage) { [string]$snapshot.failed_stage.Trim() } else { '' }),
+            $(if ($snapshot.cloud_init_status_state) { [string]$snapshot.cloud_init_status_state.Trim() } else { '' }),
+            $(if ($snapshot.cloud_init_extended_status) { [string]$snapshot.cloud_init_extended_status.Trim() } else { '' }),
+            (@($snapshot.sem_files) -join ','),
+            (@($snapshot.required_packages_missing) -join ','),
+            $activityInfo.Phase,
+            (@($activityInfo.InterestingProcesses) -join ','),
+            [string]$snapshot.bootstrap_log_mtime_epoch,
+            [string]$snapshot.cloud_init_output_mtime_epoch
+        ) -join '|'
+        if ($fingerprint -ne $lastFingerprint) {
+            $lastFingerprint = $fingerprint
+            $lastProgressAt = Get-Date
+        }
 
         $sourcesHealth = Get-UbuntuSourcesHealth -DistroName $DistroName
         if ($sourcesHealth.Status -eq 'placeholder' -or ($sourcesHealth.Status -eq 'invalid' -and $trimmedStage -eq 'install-hermes')) {
-            $diagnostics = Get-BootstrapDiagnostics -DistroName $DistroName -IncludeCloudInit
+            $diagnostics = Get-BootstrapDiagnostics -DistroName $DistroName -Snapshot $snapshot -LaunchHandle $launchHandle -IncludeCloudInit
             throw "Bootstrap detected an invalid ubuntu.sources file before completion.`n$diagnostics"
         }
 
-        if ($result -eq 'ready_for_key') {
-            if (-not $launchProcess.HasExited) {
-                $launchProcess.WaitForExit(1000) | Out-Null
+        if ($runtimeState.State -eq 'ready') {
+            if (-not $launchHandle.Process.HasExited) {
+                $launchHandle.Process.WaitForExit(1000) | Out-Null
             }
             Write-Step '无密钥 bootstrap 已完成，正在等待本地 key 输入。'
             return
         }
 
-        if ($result -like 'failed:*') {
-            $diagnostics = Get-BootstrapDiagnostics -DistroName $DistroName -IncludeCloudInit
-            throw "Bootstrap failed: $result`n$diagnostics"
+        if ($runtimeState.State -eq 'failed') {
+            $diagnostics = Get-BootstrapDiagnostics -DistroName $DistroName -Snapshot $snapshot -LaunchHandle $launchHandle -IncludeCloudInit
+            throw "Bootstrap failed: $runtimeSummary`n$diagnostics"
         }
 
-        if ($launchProcess.HasExited -and -not $result) {
-            $diagnostics = Get-BootstrapDiagnostics -DistroName $DistroName -IncludeCloudInit
-            throw "Bootstrap process exited before ready_for_key was recorded.`n$diagnostics"
+        if ($runtimeState.State -eq 'inconsistent') {
+            $diagnostics = Get-BootstrapDiagnostics -DistroName $DistroName -Snapshot $snapshot -LaunchHandle $launchHandle -IncludeCloudInit
+            throw "Bootstrap cannot continue because the managed distro is inconsistent.`n$diagnostics"
+        }
+
+        $idleDuration = (Get-Date) - $lastProgressAt
+        $launcherCanRestart = $launchHandle.Process.HasExited -and $restartCount -lt $maxRestartCount
+        $cloudInitStatusState = if ($snapshot.cloud_init_status_state) { [string]$snapshot.cloud_init_status_state.Trim() } else { '' }
+        $shouldRestart = $false
+        if ($launcherCanRestart) {
+            if ($runtimeState.State -in @('recoverable-interrupted', 'stale-running')) {
+                $shouldRestart = $true
+            }
+            elseif ($cloudInitStatusState -ne 'running' -and $idleDuration -ge [TimeSpan]::FromSeconds(30)) {
+                $shouldRestart = $true
+            }
+        }
+
+        if ($shouldRestart) {
+            $recoveryPreparation = Invoke-BootstrapRecoveryPreparation -ResolvedConfig $ResolvedConfig -Snapshot $snapshot
+            if ($recoveryPreparation.Status -eq 'inconsistent') {
+                $diagnostics = Get-BootstrapDiagnostics -DistroName $DistroName -Snapshot $snapshot -LaunchHandle $launchHandle -IncludeCloudInit
+                throw ("Bootstrap resume preparation failed: {0}`n{1}" -f $recoveryPreparation.Message, $diagnostics)
+            }
+
+            $restartCount += 1
+            Write-Step ("检测到可恢复的 bootstrap 中断状态，正在重新启动 cloud-init final（第 {0}/{1} 次）。{2}" -f $restartCount, $maxRestartCount, $recoveryPreparation.Message)
+            $launchHandle = Start-BootstrapLaunchProcess -DistroName $DistroName
+            Start-Sleep -Seconds 5
+            continue
+        }
+
+        if ($runtimeState.State -eq 'stale-running' -and -not $launcherCanRestart -and $idleDuration -ge [TimeSpan]::FromMinutes(5)) {
+            $diagnostics = Get-BootstrapDiagnostics -DistroName $DistroName -Snapshot $snapshot -LaunchHandle $launchHandle -IncludeCloudInit
+            throw "Bootstrap appears stale and is no longer making progress.`n$diagnostics"
         }
 
         if ($elapsed -ge $hard) {
             & wsl.exe --shutdown 2>$null | Out-Null
-            $lastStage = if ($stage) { $stage } else { 'unknown' }
-            $diagnostics = Get-BootstrapDiagnostics -DistroName $DistroName -IncludeCloudInit
-            throw "Bootstrap exceeded $HardTimeoutMinutes minutes. Last stage: $lastStage`n$diagnostics"
+            $diagnostics = Get-BootstrapDiagnostics -DistroName $DistroName -Snapshot $snapshot -LaunchHandle $launchHandle -IncludeCloudInit
+            throw ("Bootstrap exceeded {0} minutes. Last state: {1}. No progress for {2} minutes.`n{3}" -f $HardTimeoutMinutes, $runtimeSummary, [math]::Round($idleDuration.TotalMinutes, 2), $diagnostics)
         }
 
         if ($elapsed -ge $soft) {
-            $softTimeoutDiagnostics = Get-BootstrapDiagnostics -DistroName $DistroName
-            Write-Step "bootstrap 已超过 $SoftTimeoutMinutes 分钟。当前阶段：$stage`n$softTimeoutDiagnostics"
+            Write-Step ("bootstrap 已超过 {0} 分钟。当前状态：{1}；launcher_exit={2}；最近一次进度变化距今 {3} 分钟。" -f `
+                $SoftTimeoutMinutes,
+                $runtimeSummary,
+                $(if ($launchHandle.Process.HasExited) { $launchHandle.Process.ExitCode } else { 'running' }),
+                [math]::Round($idleDuration.TotalMinutes, 2))
         }
         else {
-            Write-Step ("当前 bootstrap 阶段：{0}" -f ($(if ($stage) { $stage } else { '等待中' })))
+            Write-Step ("当前 bootstrap 状态：{0}" -f $runtimeSummary)
         }
 
         Start-Sleep -Seconds 15
-        $launchProcess.Refresh()
     }
 }
 
 try {
     $config = Get-ResolvedInstallConfig
+    if ($config.PSObject.Properties.Name -contains 'AllowUnsafeContinue') {
+        $config.AllowUnsafeContinue = ($config.AllowUnsafeContinue -or $AllowUnsafeContinue.IsPresent)
+    }
+    else {
+        $config | Add-Member -NotePropertyName AllowUnsafeContinue -NotePropertyValue $AllowUnsafeContinue.IsPresent
+    }
     if ($config.InstallMode -ne 'dedicated') {
         throw 'windows-bootstrap.ps1 only supports the dedicated install mode.'
     }
@@ -1475,46 +2341,50 @@ try {
         }
     }
 
-    Write-Phase -Index 2 -Total $totalPhases -Message '启用 WSL 并检查是否必须重启'
+    Write-Phase -Index 2 -Total $totalPhases -Message '启用 WSL 宿主能力并检查是否必须重启'
     if ($environment.Classification -eq 'resume-hermes') {
         $completed.Add('Detected a resume-only Hermes-managed environment and skipped generic WSL platform enablement.')
-        Save-HermesState -Stage 'wsl-ready' -Config $config -LastResult 'resume-hermes'
     }
     else {
-        & wsl.exe --install --no-distribution | Out-Null
-        & wsl.exe --set-default-version 2 | Out-Null
-        $completed.Add('Ran wsl --install --no-distribution.')
-        $completed.Add('Ran wsl --set-default-version 2.')
+        $installNoDistributionResult = Invoke-WslProcess -Arguments @('--install', '--no-distribution') -TimeoutSeconds 900
+        $setDefaultVersionResult = Invoke-WslProcess -Arguments @('--set-default-version', '2') -TimeoutSeconds 300
+        $completed.Add(("Ran wsl --install --no-distribution (exit={0})." -f $installNoDistributionResult.ExitCode))
+        $completed.Add(("Ran wsl --set-default-version 2 (exit={0})." -f $setDefaultVersionResult.ExitCode))
+        if ($installNoDistributionResult.Text) {
+            Write-Step ("wsl --install --no-distribution 输出摘要：{0}" -f (Get-TextTail -Text $installNoDistributionResult.Text))
+        }
+        if ($setDefaultVersionResult.Text) {
+            Write-Step ("wsl --set-default-version 2 输出摘要：{0}" -f (Get-TextTail -Text $setDefaultVersionResult.Text))
+        }
 
         $reboot = Test-RebootPending
         if ($reboot.CBSRebootPending -or $reboot.WURebootRequired) {
-            $resumeMethod = Register-HermesResume
-            Save-HermesState -Stage 'reboot-required' -Config $config -ResumeMethod $resumeMethod -Notes 'Waiting for Windows reboot to resume setup.' -LastResult 'blocked-reboot'
-            $resumeMethodLabel = if ($resumeMethod -eq 'runonce') { 'RunOnce' } else { $resumeMethod }
-            Write-Step "检测到 Windows 需要重启，已注册一次性恢复入口（$resumeMethodLabel）。"
-            $userChoice = Show-HermesRebootRequiredDialog -ResumeMethod $resumeMethodLabel
-            if ($userChoice -eq 'restart-now') {
-                Write-Step '用户选择立即重启，Windows 即将重启。'
-                & shutdown.exe /r /t 0 | Out-Null
-            }
-            else {
-                Write-Step '用户选择稍后手动重启。'
-            }
-            return [PSCustomObject]@{
-                Status       = 'blocked-reboot'
-                ResumeMethod = $resumeMethod
-                UserChoice   = $userChoice
-                DistroName   = $config.DistroName
-                Username     = $config.Username
-            }
+            return (Invoke-BlockedRebootFlow -ResolvedConfig $config -Notes 'Waiting for Windows reboot to resume setup.' -LastResult 'blocked-reboot')
         }
 
         $completed.Add('Confirmed there is no pending reboot.')
-        Save-HermesState -Stage 'wsl-ready' -Config $config
-        $environment = Get-WslEnvironmentClassification -Config $config
     }
 
-    Write-Phase -Index 3 -Total $totalPhases -Message '准备或复用本地 WSL 安装资源'
+    Write-Phase -Index 3 -Total $totalPhases -Message '探测并修复 WSL 运行时'
+    $wslReadiness = Resolve-WslHostReadiness `
+        -ResolvedConfig $config `
+        -UsingPrebuiltBaseImage:$usingPrebuiltBaseImage `
+        -AllowUnsafeContinue:$AllowUnsafeContinue
+    if ($wslReadiness.Status -eq 'blocked-reboot') {
+        return $wslReadiness
+    }
+    if ($wslReadiness.ContinuationMode -eq 'repaired') {
+        $completed.Add('Repaired the Windows-side WSL runtime and re-ran the probe successfully.')
+    }
+    elseif ($wslReadiness.ContinuationMode -eq 'unsafe-continue') {
+        $completed.Add('Continued past the WSL probe under an explicit advanced override.')
+    }
+    else {
+        $completed.Add('Validated the Windows-side WSL runtime through the capability probe.')
+    }
+    $environment = Get-WslEnvironmentClassification -Config $config
+
+    Write-Phase -Index 4 -Total $totalPhases -Message '准备或复用本地 WSL 安装资源'
     $packagePath = Join-Path $paths.Downloads $config.PackageName
     if ($environment.Classification -eq 'resume-hermes') {
         $completed.Add('Skipped local asset preparation because the Hermes-managed distribution already exists.')
@@ -1531,16 +2401,20 @@ try {
     else {
         $metadataProbe = Try-GetRemoteFileMetadata -Uri $config.PackageUrl
         $meta = if ($metadataProbe.Success) { $metadataProbe.Metadata } else { $null }
+        $trustedContentLength = Get-TrustedRemoteContentLength -Metadata $meta
         $reuse = $false
 
         if (-not $metadataProbe.Success) {
             Write-Step ("Ubuntu 安装包远程元数据获取失败，将按本地缓存优先继续处理：{0}" -f $metadataProbe.Error)
             $completed.Add(("Ubuntu 安装包远程元数据获取失败，但仍继续处理本地缓存：{0}" -f $metadataProbe.Error))
         }
+        elseif ($null -ne $meta) {
+            Write-Step ("Ubuntu 安装包远程元数据：{0}" -f (Get-RemoteFileMetadataSummary -Metadata $meta))
+        }
 
         if (Test-Path -LiteralPath $packagePath) {
             $item = Get-Item -LiteralPath $packagePath
-            if ($item.Length -gt 0 -and ($null -eq $meta -or $meta.ContentLength -le 0 -or $item.Length -eq $meta.ContentLength)) {
+            if ($item.Length -gt 0 -and ($trustedContentLength -le 0 -or $item.Length -eq $trustedContentLength)) {
                 $reuse = $true
                 Write-Step "复用已有 Ubuntu 安装包：$packagePath"
             }
@@ -1560,13 +2434,16 @@ try {
                 -OutputPath $packagePath `
                 -Activity '正在下载 Ubuntu WSL 安装包' `
                 -StatusLabel 'Ubuntu WSL 安装包下载' `
-                -TotalBytesHint $(if ($null -ne $meta) { $meta.ContentLength } else { 0 })
+                -TotalBytesHint $trustedContentLength
         }
 
         $packageHash = Get-FileSha256OrNull -Path $packagePath
         $packageLength = (Get-Item -LiteralPath $packagePath).Length
-        if ($null -ne $meta -and $meta.ContentLength -gt 0 -and $packageLength -ne $meta.ContentLength) {
-            throw "Downloaded package size mismatch. Expected $($meta.ContentLength) bytes, got $packageLength bytes."
+        if ($trustedContentLength -gt 0 -and $packageLength -ne $trustedContentLength) {
+            throw "Downloaded package size mismatch. Expected $trustedContentLength bytes, got $packageLength bytes."
+        }
+        if ($null -ne $meta -and $trustedContentLength -le 0) {
+            Write-Step 'Ubuntu 安装包远程元数据未提供可信总大小，跳过下载后严格长度校验。'
         }
         $completed.Add(("Ubuntu package is ready: {0}" -f $packagePath))
         $completed.Add(("Recorded Ubuntu package size: {0} bytes" -f $packageLength))
@@ -1576,7 +2453,7 @@ try {
 
     Assert-SufficientDedicatedInstallDiskSpace -ResolvedConfig $config -UsingPrebuiltBaseImage:$usingPrebuiltBaseImage
 
-    Write-Phase -Index 4 -Total $totalPhases -Message '生成或准备不含密钥的 bootstrap 载荷'
+    Write-Phase -Index 5 -Total $totalPhases -Message '生成或准备不含密钥的 bootstrap 载荷'
     if ($environment.Classification -eq 'resume-hermes') {
         $completed.Add('Skipped bootstrap payload rendering because the Hermes-managed distribution already exists.')
         Save-HermesState -Stage 'cloud-init-ready' -Config $config -LastResult 'resume-hermes'
@@ -1593,7 +2470,7 @@ try {
         Save-HermesState -Stage 'cloud-init-ready' -Config $config
     }
 
-    Write-Phase -Index 5 -Total $totalPhases -Message '导入目标 WSL 发行版并轮询状态'
+    Write-Phase -Index 6 -Total $totalPhases -Message '导入目标 WSL 发行版并轮询状态'
     if ($environment.Classification -eq 'resume-hermes') {
         Write-Step "复用 Hermes 托管发行版 $($config.DistroName)。"
         $completed.Add(("Reused the Hermes-managed distribution: {0}" -f $config.DistroName))
@@ -1603,19 +2480,19 @@ try {
     }
     elseif ($usingPrebuiltBaseImage) {
         $installProcess = Start-WslImportProcess -BaseImagePath $baseImagePath -DistroName $config.DistroName
-        Wait-ForDistroRegistration -Process $installProcess -DistroName $config.DistroName
+        Wait-ForDistroRegistration -Handle $installProcess -DistroName $config.DistroName
         $completed.Add(("Imported the prebuilt Hermes WSL base image as distribution: {0}" -f $config.DistroName))
     }
     else {
         $installProcess = Start-WslInstallProcess -PackagePath $packagePath -DistroName $config.DistroName
-        Wait-ForDistroRegistration -Process $installProcess -DistroName $config.DistroName
+        Wait-ForDistroRegistration -Handle $installProcess -DistroName $config.DistroName
         $completed.Add(("Imported distribution with --no-launch: {0}" -f $config.DistroName))
     }
 
     $environment = Get-WslEnvironmentClassification -Config $config
     Save-HermesState -Stage 'distro-ready' -Config $config
 
-    Write-Phase -Index 6 -Total $totalPhases -Message '完成导入镜像的收尾并等待 ready_for_key'
+    Write-Phase -Index 7 -Total $totalPhases -Message '完成导入镜像的收尾并等待 ready_for_key'
     Save-HermesState -Stage 'install-hermes' -Config $config -LastResult 'bootstrap-running'
     if ($usingPrebuiltBaseImage -and $environment.Classification -ne 'resume-hermes') {
         Initialize-PrebuiltBaseDistro -ResolvedConfig $config
